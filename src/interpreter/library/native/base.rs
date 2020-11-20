@@ -1,5 +1,3 @@
-use pair::Pair;
-
 use crate::{environment::*, interpreter::*};
 use crate::{error::ErrorData, error::ToLocated, parser::ParameterFormals};
 use std::rc::Rc;
@@ -16,8 +14,7 @@ fn apply<R: RealNumberInternalTrait, E: IEnvironment<R>>(
     if !args.is_empty() {
         let extended = args.pop().unwrap();
         let extended = match extended {
-            Value::Pair(p) => p.into_iter().collect::<Result<ArgVec<R, E>>>()?,
-            Value::EmptyList => ArgVec::new(),
+            Value::Pair(p) => p.into_iter().collect::<ArgVec<R, E>>(),
             _ => unreachable!(),
         };
 
@@ -34,24 +31,29 @@ fn car<R: RealNumberInternalTrait, E: IEnvironment<R>>(
     arguments: impl IntoIterator<Item = Value<R, E>>,
 ) -> Result<Value<R, E>> {
     let mut iter = arguments.into_iter();
-    Ok(iter.next().unwrap().expect_list_or_pair()?.car)
+    match iter.next().unwrap().expect_list()? {
+        Pair::Some(car, _) => Ok(car),
+        empty => return error!(LogicError::TypeMisMatch(empty.to_string(), Type::Pair)),
+    }
 }
 
 fn cdr<R: RealNumberInternalTrait, E: IEnvironment<R>>(
     arguments: impl IntoIterator<Item = Value<R, E>>,
 ) -> Result<Value<R, E>> {
     let mut iter = arguments.into_iter();
-    Ok(iter.next().unwrap().expect_list_or_pair()?.cdr)
+    match iter.next().unwrap().expect_list()? {
+        Pair::Some(cdr, _) => Ok(cdr.clone()),
+        empty => return error!(LogicError::TypeMisMatch(empty.to_string(), Type::Pair)),
+    }
 }
 
 fn cons<R: RealNumberInternalTrait, E: IEnvironment<R>>(
     arguments: impl IntoIterator<Item = Value<R, E>>,
 ) -> Result<Value<R, E>> {
     let mut iter = arguments.into_iter();
-    match (iter.next(), iter.next()) {
-        (Some(car), Some(cdr)) => Ok(Value::Pair(Box::new(Pair { car, cdr }))),
-        _ => unreachable!(),
-    }
+    let car = iter.next().unwrap();
+    let cdr = iter.next().unwrap();
+    Ok(Value::Pair(Box::new(Pair::Some(car, cdr))))
 }
 
 macro_rules! value_test {
@@ -94,11 +96,11 @@ fn equivalance_predicate() {
 
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![
-            Value::Pair(Box::new(Pair::new(
+            Value::Pair(Box::new(Pair::Some(
                 Value::Character('a'),
                 Value::Character('b'),
             ))),
-            Value::Pair(Box::new(Pair::new(
+            Value::Pair(Box::new(Pair::Some(
                 Value::Character('a'),
                 Value::Character('b'),
             ))),
@@ -128,7 +130,8 @@ fn equivalance_predicate() {
         assert_eq!(eqv(arguments), Ok(Value::Boolean(false)));
     }
     {
-        let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![Value::EmptyList, Value::EmptyList];
+        let arguments: Vec<Value<f32, StandardEnv<_>>> =
+            vec![Value::from(Pair::Empty), Value::from(Pair::Empty)];
         assert_eq!(eqv(arguments), Ok(Value::Boolean(true)));
     }
 }
@@ -152,7 +155,7 @@ fn add<R: RealNumberInternalTrait, E: IEnvironment<R>>(
 }
 
 #[test]
-fn buildin_add() {
+fn builtin_add() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![];
         assert_eq!(add(arguments), Ok(Value::Number(Number::Integer(0))));
@@ -192,7 +195,7 @@ fn sub<R: RealNumberInternalTrait, E: IEnvironment<R>>(
 }
 
 #[test]
-fn buildin_sub() {
+fn builtin_sub() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![Value::Number(Number::Integer(2))];
         assert_eq!(sub(arguments), Ok(Value::Number(Number::Integer(-2))));
@@ -224,7 +227,7 @@ fn mul<R: RealNumberInternalTrait, E: IEnvironment<R>>(
 }
 
 #[test]
-fn buildin_mul() {
+fn builtin_mul() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![];
         assert_eq!(mul(arguments), Ok(Value::Number(Number::Integer(1))));
@@ -264,7 +267,7 @@ fn div<R: RealNumberInternalTrait, E: IEnvironment<R>>(
 }
 
 #[test]
-fn buildin_div() {
+fn builtin_div() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![Value::Number(Number::Integer(2))];
         assert_eq!(div(arguments), Ok(Value::Number(Number::Real(0.5))));
@@ -316,7 +319,7 @@ numeric_one_argument!("ceiling", ceiling);
 
 numeric_one_argument!("exact", exact, ?);
 #[test]
-fn buildin_numeric_one() {
+fn builtin_numeric_one() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> =
             vec![Value::Number(Number::Rational(-49, 3))];
@@ -340,7 +343,7 @@ macro_rules! numeric_two_arguments {
 numeric_two_arguments!("floor-quotient", floor_quotient, ?);
 numeric_two_arguments!("floor-remainder", floor_remainder, ?);
 #[test]
-fn buildin_numeric_two() {
+fn builtin_numeric_two() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![
             Value::Number(Number::Integer(8)),
@@ -375,7 +378,7 @@ fn make_vector<R: RealNumberInternalTrait, E: IEnvironment<R>>(
 }
 
 #[test]
-fn buildin_make_vector() {
+fn builtin_make_vector() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> =
             vec![Value::Number(Number::Integer(3)), Value::Boolean(true)];
@@ -412,7 +415,7 @@ fn vector_length<R: RealNumberInternalTrait, E: IEnvironment<R>>(
 }
 
 #[test]
-fn buildin_vector_length() {
+fn builtin_vector_length() {
     {
         let vector: Value<f32, StandardEnv<_>> =
             Value::Vector(ValueReference::new_immutable(vec![
@@ -451,7 +454,7 @@ fn vector_ref<R: RealNumberInternalTrait, E: IEnvironment<R>>(
 }
 
 #[test]
-fn buildin_vector_ref() {
+fn builtin_vector_ref() {
     let vector: Value<f32, StandardEnv<_>> = Value::Vector(ValueReference::new_immutable(vec![
         Value::Number(Number::Integer(5)),
         Value::String("foo".to_string()),
@@ -498,7 +501,7 @@ fn vector_set<R: RealNumberInternalTrait, E: IEnvironment<R>>(
 }
 
 #[test]
-fn buildin_vector_set() -> Result<()> {
+fn builtin_vector_set() -> Result<()> {
     let vector: Value<f32, StandardEnv<_>> = Value::Vector(ValueReference::new_mutable(vec![
         Value::Number(Number::Integer(5)),
         Value::String("foo".to_string()),
@@ -607,7 +610,7 @@ typed_comparision!(less_equal, <=, expect_number);
 typed_comparision!(boolean_equal, <=, expect_boolean);
 
 #[test]
-fn buildin_greater() {
+fn builtin_greater() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![];
         assert_eq!(greater(arguments), Ok(Value::Boolean(true)));
@@ -669,7 +672,7 @@ first_of_order!(max, >);
 first_of_order!(min, <);
 
 #[test]
-fn buildin_min() {
+fn builtin_min() {
     {
         let arguments: Vec<Value<f32, StandardEnv<_>>> = vec![Value::Number(Number::Integer(2))];
         assert_eq!(min(arguments), Ok(Value::Number(Number::Integer(2))));
@@ -846,13 +849,13 @@ pub fn library_map<R: RealNumberInternalTrait, E: IEnvironment<R>>() -> Vec<(Str
 }
 
 #[test]
-fn buildin_parameters_length() -> Result<()> {
+fn builtin_parameters_length() -> Result<()> {
     let base_library_map = library_map::<f32, StandardEnv<_>>();
     assert!(matches!(
         &base_library_map.iter().find(|(name, _) |name.as_str() == "sqrt").unwrap().1,
-        Value::Procedure(Procedure::Buildin(sqrt)) if sqrt.parameters.0.len() == 1));
+        Value::Procedure(Procedure::Builtin(sqrt)) if sqrt.parameters.0.len() == 1));
     assert!(matches!(
         &base_library_map.iter().find(|(name, _) |name.as_str() == "newline").unwrap().1,
-        Value::Procedure(Procedure::Buildin(newline)) if newline.parameters.0.len() == 0));
+        Value::Procedure(Procedure::Builtin(newline)) if newline.parameters.0.len() == 0));
     Ok(())
 }

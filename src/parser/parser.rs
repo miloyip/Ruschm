@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use super::Result;
+use super::{pair::GenericPair, pair::Pairable, Datum, DatumBody, DatumPair, Result};
 use crate::interpreter::library::LibraryName;
 use crate::parser::lexer::TokenData;
 use crate::{error::*, interpreter::library::LibraryNameElement, parser::lexer::Token};
@@ -108,16 +108,21 @@ impl ToLocated for ImportSetBody {}
 pub type Expression = Located<ExpressionBody>;
 #[derive(PartialEq, Debug, Clone)]
 pub enum ExpressionBody {
-    Identifier(String),
+    Symbol(String),
     Primitive(Primitive),
     Period,
-    List(Vec<Expression>),
-    Vector(Vec<Expression>),
     Assignment(String, Box<Expression>),
     Procedure(SchemeProcedure),
     ProcedureCall(Box<Expression>, Vec<Expression>),
     Conditional(Box<(Expression, Expression, Option<Expression>)>),
-    Quote(Box<Expression>),
+    Quote(Box<Datum>),
+    Datum(Datum),
+}
+
+impl From<i32> for ExpressionBody {
+    fn from(integer: i32) -> Self {
+        ExpressionBody::Datum(DatumBody::Primitive(Primitive::Integer(integer)).into())
+    }
 }
 
 impl ToLocated for ExpressionBody {}
@@ -198,61 +203,136 @@ impl<TokenIter: Iterator<Item = Result<Token>>> Parser<TokenIter> {
         }
     }
     pub fn parse_current(&mut self) -> Result<Option<Statement>> {
-        match self.current.take() {
-            Some(Token { data, location }) => Ok(Some(match data {
-                TokenData::Primitive(p) => Expression {
-                    data: ExpressionBody::Primitive(p),
-                    location,
-                }
-                .into(),
-                TokenData::Identifier(a) => Expression {
-                    data: ExpressionBody::Identifier(a),
-                    location,
-                }
-                .into(),
-                TokenData::LeftParen => match self.peek_next_token()? {
-                    Some(Token {
-                        data: TokenData::Identifier(ident),
-                        ..
-                    }) => match ident.as_str() {
-                        "lambda" => self.lambda()?.into(),
-                        "quote" => {
-                            self.advance(2)?;
-                            let quoted = self.quote()?;
-                            self.expect_next_nth(1, TokenData::RightParen)?;
-                            quoted.into()
-                        }
-                        "define" => self.definition()?.into(),
-                        "define-syntax" => self.def_syntax()?.into(),
-                        "define-library" => self.library()?.into(),
-                        "set!" => self.assginment()?.into(),
-                        "import" => self.import_declaration()?.into(),
-                        "if" => self.condition()?.into(),
-                        _ => self.procedure_call()?.into(),
+        Ok(match self.current_datum()? {
+            Some(datum) => Some(Self::transform_to_statement(datum)?),
+            None => None,
+        })
+    }
+
+    pub fn transform_to_statement(datum: Datum) -> Result<Statement> {
+        let location = datum.location;
+        Ok(match datum.data {
+            DatumBody::Primitive(p) => ExpressionBody::Primitive(p).locate(location).into(),
+            DatumBody::Symbol(s) => ExpressionBody::Symbol(s).locate(location).into(),
+            DatumBody::List(list) => {
+                let mut iter = list.into_iter();
+                let keyword = iter.next();
+                match keyword {
+                    None => return error!(SyntaxError::EmptyCall),
+                    Some(keyword) => match keyword.data {
+                        DatumBody::Symbol(keyword) => match keyword.as_str() {
+                            "define" => Self::transform_definition(iter)?
+                                .locate(datum.location)
+                                .into(),
+                            "define-library" => Self::transform_library(iter)?.locate(datum.location).into(),
+                            "if" => Self::transform_condition(iter)?
+                                .locate(datum.location)
+                                .into(),
+                            "import" => Self::transform_import(iter)?.locate(datum.location).into(),
+                            "quote" => Self::transform_quote(iter)?.locate(datum.location).into(),
+                            "set!" => Self::transform_assignment(iter)?
+                                .locate(datum.location)
+                                .into(),
+                            _ => todo!(),
+                        },
+                        _ => todo!(),
                     },
-                    Some(Token {
-                        data: TokenData::RightParen,
-                        location,
-                    }) => return located_error!(SyntaxError::EmptyCall, *location),
-                    _ => self.procedure_call()?.into(),
-                },
-                TokenData::RightParen => {
-                    return located_error!(SyntaxError::UnmatchedParentheses, location)
                 }
-                TokenData::VecConsIntro => self.vector()?.into(),
-                TokenData::Quote => {
-                    self.advance(1)?;
-                    self.quote()?.into()
-                }
-                TokenData::Period => Expression {
-                    data: ExpressionBody::Period,
-                    location,
-                }
-                .into(),
-                _ => panic!("unsupported grammar"),
-            })),
-            None => Ok(None),
+            }
+            other => ExpressionBody::Datum(Datum {
+                data: other,
+                location,
+            })
+            .locate(location)
+            .into(),
+        })
+    }
+
+    pub fn transform_to_expression(datum: Datum) -> Result<Expression> {
+        match Self::transform_to_statement(datum)? {
+            Statement::Expression(expression) => Ok(expression),
+            _ => error!(SyntaxError::ExpectSomething("expression".to_string())),
         }
+    }
+
+    pub fn current_datum(&mut self) -> Result<Option<Datum>> {
+        match self.current.take() {
+            None => Ok(None),
+            Some(current) => match current {
+                Token { data, location } => Ok(match data {
+                    TokenData::Primitive(p) => Datum {
+                        data: DatumBody::Primitive(p),
+                        location,
+                    }
+                    .into(),
+                    TokenData::Identifier(a) => Datum {
+                        data: DatumBody::Symbol(a),
+                        location,
+                    }
+                    .into(),
+                    TokenData::LeftParen => todo!(),
+                    TokenData::RightParen => {
+                        return located_error!(SyntaxError::UnmatchedParentheses, location)
+                    }
+                    TokenData::VecConsIntro => self.vector()?.into(),
+                    TokenData::Quote => {
+                        self.advance(1)?;
+                        self.parse_quoted()?
+                    }
+                    .into(),
+                    other => return located_error!(SyntaxError::UnexpectedToken(other), location),
+                }),
+            },
+        }
+    }
+
+    pub fn unwrap_non_end<T>(op: Option<T>) -> Result<T> {
+        op.ok_or(error!(SyntaxError::UnexpectedEnd)?)
+    }
+
+    pub fn current_list_or_pair(&mut self) -> Result<Datum> {
+        let mut head = Box::new(DatumPair::Empty);
+        let mut tail = head.as_mut();
+        let list_location = self.location;
+        let mut encounter_period = false;
+        loop {
+            match self.advance_unwrap(1)? {
+                Token { data, location } => match data {
+                    TokenData::Period => {
+                        if encounter_period {
+                            return located_error!(
+                                SyntaxError::UnexpectedToken(TokenData::Period),
+                                location.clone()
+                            );
+                        }
+                        encounter_period = true;
+                        continue;
+                    }
+                    TokenData::RightParen => break,
+                    _ => {
+                        let element = Self::unwrap_non_end(self.current_datum()?)?;
+                        match tail {
+                            DatumPair::Empty => {
+                                head = Box::new(DatumPair::Some(
+                                    element,
+                                    Datum::from(Box::new(DatumPair::Empty)),
+                                ));
+                                tail = head.as_mut();
+                            }
+                            DatumPair::Some(_, cdr) => {
+                                let new_tail = Box::new(GenericPair::Some(
+                                    element,
+                                    Datum::from(Box::new(DatumPair::Empty)),
+                                ));
+                                *cdr = Datum::from(new_tail);
+                                tail = cdr.either_pair_mut().left().unwrap();
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        Ok(DatumBody::List(head).locate(list_location))
     }
 
     pub fn current_expression(&mut self) -> Result<Expression> {
@@ -281,109 +361,53 @@ impl<TokenIter: Iterator<Item = Result<Token>>> Parser<TokenIter> {
         self.advance(1)?;
         self.parse_current()
     }
-    fn library(&mut self) -> Result<Located<LibraryDefinition>> {
-        let location = self.location;
-        self.advance(2)?;
-        match self.current.as_ref().map(Deref::deref) {
-            Some(TokenData::LeftParen) => {
-                let library_name = self.library_name()?;
-                let library_declarations: Result<Vec<_>> =
-                    self.repeat(Self::library_declaration).collect();
-                Ok(LibraryDefinition(library_name, library_declarations?).locate(location))
-            }
-            other => located_error!(
-                SyntaxError::TokenMisMatch(TokenData::LeftParen, other.map(Clone::clone)),
-                self.location
-            ),
-        }
+
+    fn transform_library(mut datums: impl Iterator<Item = Datum>) -> Result<LibraryDefinition> {
+        let library_name = Self::transform_library_name(Self::unwrap_non_end(datums.next())?)?;
+        let library_declarations = datums.map(Self::transform_library_declaration).collect::<Result<_>>()?;
+        Ok(LibraryDefinition(library_name, library_declarations))
     }
 
-    fn library_declaration(&mut self) -> Result<Located<LibraryDeclaration>> {
-        let location = self.location;
-        match self.current.take().map(Located::extract_data) {
-            Some(TokenData::LeftParen) => {
-                let token = self.peek_next_token()?;
-                match token.map(Deref::deref) {
-                    Some(TokenData::Identifier(identifier)) => match identifier.as_str() {
-                        "import" => Ok(LibraryDeclaration::ImportDeclaration(
-                            self.import_declaration()?,
-                        )
-                        .locate(location)),
-                        "export" => {
-                            self.advance(1)?;
-                            Ok(Located::from(LibraryDeclaration::Export(
-                                self.repeat(Self::export_spec).collect::<Result<Vec<_>>>()?,
-                            )))
-                        }
-                        "begin" => {
-                            self.advance(1)?;
-                            Ok(Located::from(LibraryDeclaration::Begin(
-                                self.repeat(Self::statement).collect::<Result<Vec<_>>>()?,
-                            )))
-                        }
-                        _ => located_error!(
-                            SyntaxError::ExpectSomething("import/export/begin".to_string()),
-                            token.unwrap().location
-                        ),
-                    },
-                    Some(_) => located_error!(
-                        SyntaxError::ExpectSomething("import/export/begin".to_string()),
-                        token.unwrap().location
-                    ),
-                    None => located_error!(SyntaxError::UnexpectedEnd, location),
-                }
-            }
-            other => located_error!(
-                SyntaxError::TokenMisMatch(TokenData::LeftParen, other),
-                location
-            ),
-        }
+    fn transform_library_declaration(mut datum: Datum) -> Result<Located<LibraryDeclaration>> {
+        let location = datum.location;
+        let mut iter = datum.expect_list()?.into_iter().peekable();
+        Ok(match Self::unwrap_non_end(iter.peek())?.data {
+            DatumBody::Symbol(first) if first == "export" => LibraryDeclaration::Export(iter.map(Self::transform_export_spec).collect::<Result<_>>()?),
+            DatumBody::Symbol(first) if first == "begin" => LibraryDeclaration::Begin(iter.map(Self::transform_to_statement).collect::<Result<_>>()?),
+            other => LibraryDeclaration::ImportDeclaration(Self::transform_import(iter)?.locate(location))
+        }.locate(location))
     }
 
-    fn export_spec(&mut self) -> Result<Located<ExportSpec>> {
-        let location = self.location;
-        match self.current.take().map(Located::extract_data) {
-            Some(TokenData::LeftParen) => {
-                self.advance(1)?;
-                self.expect_next_nth(0, TokenData::Identifier("rename".to_string()))?;
-                let from = self.next_identifier()?;
-                let to = self.next_identifier()?;
-                self.expect_next_nth(1, TokenData::RightParen)?;
-                Ok(Located::from(ExportSpec::Rename(from, to)))
-            }
-            Some(TokenData::Identifier(identifier)) => {
-                Ok(Located::from(ExportSpec::Direct(identifier)))
-            }
-            Some(other) => located_error!(SyntaxError::UnexpectedToken(other), location),
-            None => located_error!(SyntaxError::UnexpectedEnd, location),
-        }
+    fn transform_export_spec(mut datum: Datum) -> Result<Located<ExportSpec>> {
+        Ok(match datum.data {
+            DatumBody::Symbol(ident) => ExportSpec::Direct(ident),
+            DatumBody::List(list) => {
+                let mut iter = list.into_iter();
+                match Self::unwrap_non_end(iter.next())? {
+                    Datum {data: DatumBody::Symbol(ident), ..} if ident == "rename" => (),
+                    o => return error!(SyntaxError::UnexpectedDatum(o)),
+                };
+                ExportSpec::Rename(Self::transform_identifier(Self::unwrap_non_end(iter.next())?)?, Self::transform_identifier(Self::unwrap_non_end(iter.next())?)?)
+            },
+            o => return error!(SyntaxError::UnexpectedDatum(datum)),
+        }.locate(datum.location))
     }
 
-    fn expression(&mut self) -> Result<Expression> {
-        self.advance(1)?;
-        self.current_expression()
-    }
 
-    fn next_identifier(&mut self) -> Result<String> {
-        self.advance(1)?;
-        self.current_identifier()
-    }
-
-    fn current_identifier(&mut self) -> Result<String> {
-        match self.current.as_ref().map(|t| &t.data) {
-            Some(TokenData::Identifier(ident)) => Ok(ident.clone()),
+    fn transform_identifier(mut datum: Datum) -> Result<String> {
+        match datum.data {
+            DatumBody::Symbol(ident) => Ok(ident.clone()),
             _ => located_error!(
                 SyntaxError::ExpectSomething("identifier".to_string()),
-                self.location
+                datum.location
             ),
         }
     }
 
-    fn current_identifier_pair(&mut self) -> Result<(String, String)> {
-        self.expect_next_nth(0, TokenData::LeftParen)?;
-        let car = self.next_identifier()?;
-        let cdr = self.next_identifier()?;
-        self.expect_next_nth(1, TokenData::RightParen)?;
+    fn transform_identifier_pair(mut datum: Datum) -> Result<(String, String)> {
+        let mut iter = datum.expect_list()?.into_iter();
+        let car = Self::transform_identifier(Self::unwrap_non_end(iter.next())?)?;
+        let cdr = Self::transform_identifier(Self::unwrap_non_end(iter.next())?)?;
         Ok((car, cdr))
     }
 
@@ -422,9 +446,9 @@ impl<TokenIter: Iterator<Item = Result<Token>>> Parser<TokenIter> {
             .map(|e| e.unwrap())
     }
 
-    fn vector(&mut self) -> Result<Expression> {
+    fn vector(&mut self) -> Result<Datum> {
         let vec = self.repeat(Self::datum).collect::<Result<_>>()?;
-        Ok(self.locate(ExpressionBody::Vector(vec)))
+        Ok(self.locate(DatumBody::Vector(vec)))
     }
 
     fn procedure_formals(&mut self) -> Result<ParameterFormals> {
@@ -449,33 +473,43 @@ impl<TokenIter: Iterator<Item = Result<Token>>> Parser<TokenIter> {
         }
     }
 
-    fn quote(&mut self) -> Result<Expression> {
+    fn parse_quoted(&mut self) -> Result<Datum> {
+        let quote_location = self.location;
         let inner = self.datum()?;
-        Ok(Expression {
-            data: ExpressionBody::Quote(Box::new(inner)),
-            location: self.location,
+        Ok(Datum {
+            location: quote_location,
+            data: DatumBody::List(
+                vec![
+                    Datum {
+                        data: DatumBody::Symbol("quote".to_string()),
+                        location: quote_location,
+                    },
+                    inner,
+                ]
+                .into_iter()
+                .collect(),
+            ),
         })
     }
 
-    fn datum(&mut self) -> Result<Expression> {
-        Ok(match self.current.as_ref().map(|t| &t.data) {
-            Some(TokenData::LeftParen) => {
-                let seq = self.repeat(Self::datum).collect::<Result<_>>()?;
-                Expression {
-                    data: ExpressionBody::List(seq),
-                    location: self.location,
-                }
+    fn transform_quote(mut datums: impl Iterator<Item = Datum>) -> Result<ExpressionBody> {
+        Ok(ExpressionBody::Quote(Box::new(Self::unwrap_non_end(
+            datums.next(),
+        )?)))
+    }
+
+    fn datum(&mut self) -> Result<Datum> {
+        Ok(match self.advance_unwrap_take(0)?.data {
+            TokenData::LeftParen => {
+                DatumBody::List(self.repeat(Self::datum).collect::<Result<_>>()?)
             }
-            Some(TokenData::VecConsIntro) => {
-                let seq = self.repeat(Self::datum).collect::<Result<_>>()?;
-                Expression {
-                    data: ExpressionBody::Vector(seq),
-                    location: self.location,
-                }
+            TokenData::VecConsIntro => {
+                DatumBody::Vector(self.repeat(Self::datum).collect::<Result<_>>()?)
             }
-            None => return located_error!(SyntaxError::UnexpectedEnd, self.location),
-            _ => self.current_expression()?,
-        })
+            TokenData::Primitive(p) => DatumBody::Primitive(p),
+            other => return located_error!(SyntaxError::UnexpectedToken(other), self.location),
+        }
+        .locate(self.location))
     }
 
     fn lambda(&mut self) -> Result<Expression> {
@@ -532,166 +566,87 @@ impl<TokenIter: Iterator<Item = Result<Token>>> Parser<TokenIter> {
         ))))
     }
 
-    fn import_declaration(&mut self) -> Result<Located<ImportDeclaration>> {
-        let location = self.location;
-        self.expect_next_nth(1, TokenData::Identifier("import".to_string()))?;
-        Ok(
-            ImportDeclaration(self.repeat(Self::import_set).collect::<Result<_>>()?)
-                .locate(location),
-        )
+    fn transform_import(mut datums: impl Iterator<Item = Datum>) -> Result<ImportDeclaration> {
+        Ok(ImportDeclaration(
+            datums
+                .map(|import_set| Self::transform_import_set(import_set))
+                .collect::<Result<_>>()?,
+        ))
     }
 
-    fn condition(&mut self) -> Result<Expression> {
-        self.advance(1)?;
-        let test = self.expression()?;
-        let consequent = self.expression()?;
-        match self.advance_unwrap(1)?.data {
-            TokenData::RightParen => Ok(Expression {
-                data: ExpressionBody::Conditional(Box::new((test, consequent, None))),
-                location: self.location,
-            }),
-            _ => {
-                let alternative = self.current_expression()?;
-                self.expect_next_nth(1, TokenData::RightParen)?;
-                Ok(Expression {
-                    data: ExpressionBody::Conditional(Box::new((
-                        test,
-                        consequent,
-                        Some(alternative),
-                    ))),
-                    location: self.location,
-                })
-            }
-        }
+    fn transform_condition(mut asts: impl Iterator<Item = Datum>) -> Result<ExpressionBody> {
+        let test = Self::transform_to_expression(Self::unwrap_non_end(asts.next())?)?;
+        let consequent = Self::transform_to_expression(Self::unwrap_non_end(asts.next())?)?;
+        let alternative = asts.next().map(Self::transform_to_expression).transpose()?;
+        Ok(ExpressionBody::Conditional(Box::new((
+            test,
+            consequent,
+            alternative,
+        ))))
     }
 
-    fn library_name_element(&mut self) -> Result<Located<LibraryNameElement>> {
-        let location = self.location;
-        match self.current.take() {
-            Some(token) => match token.data {
-                TokenData::Identifier(identifier) => {
-                    Ok(LibraryNameElement::Identifier(identifier).locate(self.location))
-                }
-                TokenData::Primitive(Primitive::Integer(i)) => {
-                    if i >= 0 {
-                        Ok(LibraryNameElement::Integer(i as u32).locate(self.location))
-                    } else {
-                        located_error!(
-                            SyntaxError::ExpectSomething("non-negative integer".to_string()),
-                            location
-                        )
-                    }
-                }
-                token => located_error!(SyntaxError::UnexpectedToken(token), self.location),
-            },
-            None => located_error!(SyntaxError::UnexpectedEnd, self.location),
-        }
-    }
-    fn library_name(&mut self) -> Result<Located<LibraryName>> {
-        let location = self.location;
-        match self.current.take().map(Located::extract_data) {
-            Some(TokenData::LeftParen) => Ok(LibraryName(
-                self.repeat(Self::library_name_element)
-                    .collect::<Result<Vec<Located<LibraryNameElement>>>>()?
-                    .into_iter()
-                    .map(Located::extract_data)
-                    .collect(),
-            )
-            .locate(location)),
-            other => located_error!(
-                SyntaxError::TokenMisMatch(TokenData::LeftParen, other),
-                location
-            )?,
-        }
-    }
+    fn transform_library_name_part(mut datum: Datum) -> Result<LibraryNameElement> {
+        let location = datum.location;
+        match datum.data {
+                DatumBody::Symbol(identifier) =>
+                    Ok(LibraryNameElement::Identifier(identifier)),
+                DatumBody::Primitive(Primitive::Integer(i)) if i >=0 => {
+                        Ok(LibraryNameElement::Integer(i as u32))
 
-    fn import_set(&mut self) -> Result<ImportSet> {
-        let location = self.location;
-        Ok(match self.current.as_ref().map(Deref::deref) {
-            Some(TokenData::LeftParen) => match self.peek_next_token()?.map(|token| &token.data) {
-                Some(TokenData::Identifier(ident)) => match ident.as_str() {
-                    "only" => {
-                        self.advance(2)?;
-                        ImportSet {
-                            data: ImportSetBody::Only(
-                                Box::new(self.import_set()?),
-                                self.repeat(Self::current_identifier)
-                                    .collect::<Result<_>>()?,
-                            ),
-                            location,
-                        }
-                    }
-                    "except" => {
-                        self.advance(2)?;
-                        ImportSet {
-                            data: ImportSetBody::Except(
-                                Box::new(self.import_set()?),
-                                self.repeat(Self::current_identifier)
-                                    .collect::<Result<_>>()?,
-                            ),
-                            location,
-                        }
-                    }
-                    "prefix" => {
-                        self.advance(2)?;
-                        ImportSet {
-                            data: ImportSetBody::Prefix(
-                                Box::new(self.import_set()?),
-                                self.next_identifier()?,
-                            ),
-                            location,
-                        }
-                    }
-                    "rename" => {
-                        self.advance(2)?;
-                        ImportSet {
-                            data: ImportSetBody::Rename(
-                                Box::new(self.import_set()?),
-                                self.repeat(Self::current_identifier_pair)
-                                    .collect::<Result<_>>()?,
-                            ),
-                            location,
-                        }
-                    }
-                    _ => ImportSetBody::Direct(self.library_name()?).locate(location),
                 },
-                _ => ImportSetBody::Direct(self.library_name()?).locate(location),
-            },
-            other => located_error!(
-                SyntaxError::TokenMisMatch(TokenData::LeftParen, other.map(Clone::clone)),
-                location
-            )?,
-        })
+                o => located_error!(SyntaxError::UnexpectedDatum(o.locate(location)), location),
+        }
     }
 
-    fn definition(&mut self) -> Result<Definition> {
-        let location = self.location;
-        let current = self.advance(2)?.take().map(|t| t.data);
-        match current {
-            Some(TokenData::Identifier(identifier)) => {
-                let expr = self.expression()?;
-                self.expect_next_nth(1, TokenData::RightParen)?;
-                Ok(Definition {
-                    data: DefinitionBody(identifier, expr),
-                    location,
-                })
+    fn transform_library_name(datum: Datum) -> Result<Located<LibraryName>> {
+        let location = datum.location;
+        Ok(LibraryName(datum.expect_list()?.into_iter().map(Self::transform_library_name_part).collect::<Result<_>>()?).locate(location))
+    }
+
+    fn transform_import_set(mut datum: Datum) -> Result<ImportSet> {
+        let mut iter = datum.expect_list()?.into_iter();
+        let first = Self::unwrap_non_end(iter.next())?;
+        Ok(match first.data {
+            DatumBody::Symbol(spec) if spec == "only" => {
+                let sub_import = Self::transform_import_set(Self::unwrap_non_end(iter.next())?)?;
+                let idents = iter
+                    .map(Self::transform_identifier)
+                    .collect::<Result<_>>()?;
+                ImportSetBody::Only(Box::new(sub_import), idents)
             }
-            Some(TokenData::LeftParen) => {
-                let identifier = self.next_identifier()?;
-                let mut formals = ParameterFormals::new();
-                match self.peek_next_token()?.map(|t| &t.data) {
-                    Some(TokenData::Period) => {
-                        self.advance(2)?;
-                        formals.1 = Some(self.current_identifier()?);
-                        self.advance(1)?;
-                    }
-                    _ => formals = self.procedure_formals()?,
-                }
-                let body = self.procedure_body(formals)?;
-                Ok(Definition::from(DefinitionBody(identifier, body)))
+            DatumBody::Symbol(spec) if spec == "except" => {
+                let sub_import = Self::transform_import_set(Self::unwrap_non_end(iter.next())?)?;
+                let idents = iter
+                    .map(Self::transform_identifier)
+                    .collect::<Result<_>>()?;
+                ImportSetBody::Except(Box::new(sub_import), idents)
             }
-            _ => located_error!(SyntaxError::IllegalDefinition, self.location),
+            DatumBody::Symbol(spec) if spec == "prefix" => {
+                let sub_import = Self::transform_import_set(Self::unwrap_non_end(iter.next())?)?;
+                let ident = Self::transform_identifier(Self::unwrap_non_end(iter.next())?)?;
+                ImportSetBody::Prefix(Box::new(sub_import), ident)
+            }
+            DatumBody::Symbol(spec) if spec == "rename" => {
+                let sub_import = Self::transform_import_set(Self::unwrap_non_end(iter.next())?)?;
+                let renaming = iter.map(Self::transform_identifier_pair).collect()?;
+                ImportSetBody::Rename(Box::new(sub_import), renaming)
+            }
+            DatumBody::Symbol(direct) =>
+            _ => ImportSetBody::Direct(self.library_name()?).locate(location),
         }
+        .locate(first.location))
+    }
+
+    fn transform_definition(mut datums: impl Iterator<Item = Datum>) -> Result<DefinitionBody> {
+        let symbol = match Self::unwrap_non_end(datums.next())? {
+            Datum {
+                data: DatumBody::Symbol(symbol),
+                ..
+            } => symbol,
+            other => return error!(SyntaxError::DefineNonSymbol(other)),
+        };
+        let body = Self::transform_to_expression(Self::unwrap_non_end(datums.next())?)?;
+        Ok(DefinitionBody(symbol, body))
     }
 
     fn def_syntax(&mut self) -> Result<SyntaxDef> {
@@ -915,22 +870,28 @@ impl<TokenIter: Iterator<Item = Result<Token>>> Parser<TokenIter> {
         })
     }
 
-    fn assginment(&mut self) -> Result<Expression> {
-        let location = self.location;
-        self.advance(2)?;
-        let symbol = self.current_identifier()?;
-        let value = self.expression()?;
-        self.expect_next_nth(1, TokenData::RightParen)?;
-        Ok(ExpressionBody::Assignment(symbol, Box::new(value)).locate(location))
+    fn transform_assignment(mut datums: impl Iterator<Item = Datum>) -> Result<ExpressionBody> {
+        let symbol = match Self::unwrap_non_end(datums.next())? {
+            Datum {
+                data: DatumBody::Symbol(symbol),
+                ..
+            } => symbol,
+            other => return error!(SyntaxError::DefineNonSymbol(other)),
+        };
+        let body = Self::transform_to_expression(Self::unwrap_non_end(datums.next())?)?;
+        Ok(ExpressionBody::Assignment(symbol, Box::new(body)))
     }
 
-    fn procedure_call(&mut self) -> Result<Expression> {
-        let location = self.location;
-        let operator = self.expression()?;
-        let arguments = self
-            .repeat(Self::current_expression)
-            .collect::<Result<Vec<Expression>>>()?;
-        Ok(ExpressionBody::ProcedureCall(Box::new(operator), arguments).locate(location))
+    fn transform_procedure_call(
+        first: Datum,
+        datum: impl Iterator<Item = Datum>,
+    ) -> Result<ExpressionBody> {
+        Ok(ExpressionBody::ProcedureCall(
+            Box::new(Self::transform_to_expression(first)?),
+            datum
+                .map(Self::transform_to_expression)
+                .collect::<Result<Vec<_>>>()?,
+        ))
     }
 
     fn advance(&mut self, count: usize) -> Result<&mut Option<Token>> {
@@ -1074,7 +1035,7 @@ fn identifier() -> Result<()> {
     let ast = parser.parse()?;
     assert_eq!(
         ast,
-        expr_body_to_statement(ExpressionBody::Identifier("test".to_string()))
+        expr_body_to_statement(ExpressionBody::Symbol("test".to_string()))
     );
     Ok(())
 }
@@ -1091,10 +1052,13 @@ fn vector() -> Result<()> {
     let ast = parser.parse()?;
     assert_eq!(
         ast,
-        expr_body_to_statement(ExpressionBody::Vector(convert_located(vec![
-            Primitive::Integer(1).into(),
-            Primitive::Boolean(false).into()
-        ])))
+        expr_body_to_statement(ExpressionBody::Datum(
+            DatumBody::Vector(convert_located(vec![
+                DatumBody::Primitive(Primitive::Integer(1)),
+                DatumBody::Primitive(Primitive::Boolean(false))
+            ]))
+            .into()
+        ))
     );
     Ok(())
 }
@@ -1128,7 +1092,7 @@ fn procedure_call() -> Result<()> {
     assert_eq!(
         ast,
         expr_body_to_statement(ExpressionBody::ProcedureCall(
-            Box::new(ExpressionBody::Identifier("+".to_string()).into()),
+            Box::new(ExpressionBody::Symbol("+".to_string()).into()),
             vec![
                 Primitive::Integer(1).into(),
                 Primitive::Integer(2).into(),
@@ -1201,10 +1165,10 @@ fn definition() -> Result<()> {
                     simple_procedure(
                         ParameterFormals(vec!["x".to_string(), "y".to_string()], None),
                         ExpressionBody::ProcedureCall(
-                            Box::new(ExpressionBody::Identifier("+".to_string()).into()),
+                            Box::new(ExpressionBody::Symbol("+".to_string()).into()),
                             vec![
-                                ExpressionBody::Identifier("x".to_string()).into(),
-                                ExpressionBody::Identifier("y".to_string()).into(),
+                                ExpressionBody::Symbol("x".to_string()).into(),
+                                ExpressionBody::Symbol("y".to_string()).into(),
                             ]
                         )
                         .into()
@@ -1232,7 +1196,7 @@ fn definition() -> Result<()> {
                     "add".to_string(),
                     simple_procedure(
                         ParameterFormals(vec![], Some("x".to_string())),
-                        ExpressionBody::Identifier("x".to_string()).into()
+                        ExpressionBody::Symbol("x".to_string()).into()
                     )
                 ))
             )
@@ -1259,11 +1223,11 @@ fn nested_procedure_call() -> Result<()> {
     assert_eq!(
         ast,
         expr_body_to_statement(ExpressionBody::ProcedureCall(
-            Box::new(ExpressionBody::Identifier("+".to_string()).into()),
+            Box::new(ExpressionBody::Symbol("+".to_string()).into()),
             vec![
                 Primitive::Integer(1).into(),
                 ExpressionBody::ProcedureCall(
-                    Box::new(ExpressionBody::Identifier("-".to_string()).into()),
+                    Box::new(ExpressionBody::Symbol("-".to_string()).into()),
                     vec![Primitive::Integer(2).into(), Primitive::Integer(3).into()]
                 )
                 .into(),
@@ -1297,10 +1261,10 @@ fn lambda() -> Result<()> {
             Some(Statement::Expression(simple_procedure(
                 ParameterFormals(vec!["x".to_string(), "y".to_string()], None),
                 ExpressionBody::ProcedureCall(
-                    Box::new(ExpressionBody::Identifier("+".to_string()).into()),
+                    Box::new(ExpressionBody::Symbol("+".to_string()).into()),
                     vec![
-                        ExpressionBody::Identifier("x".to_string()).into(),
-                        ExpressionBody::Identifier("y".to_string()).into()
+                        ExpressionBody::Symbol("x".to_string()).into(),
+                        ExpressionBody::Symbol("y".to_string()).into()
                     ]
                 )
                 .into()
@@ -1339,10 +1303,10 @@ fn lambda() -> Result<()> {
                         Primitive::Integer(1).into()
                     ))],
                     vec![ExpressionBody::ProcedureCall(
-                        Box::new(ExpressionBody::Identifier("+".to_string()).into()),
+                        Box::new(ExpressionBody::Symbol("+".to_string()).into()),
                         vec![
-                            ExpressionBody::Identifier("x".to_string()).into(),
-                            ExpressionBody::Identifier("y".to_string()).into()
+                            ExpressionBody::Symbol("x".to_string()).into(),
+                            ExpressionBody::Symbol("y".to_string()).into()
                         ]
                     )
                     .into()]
@@ -1399,10 +1363,10 @@ fn lambda() -> Result<()> {
                     ParameterFormals(vec!["x".to_string()], Some("y".to_string())),
                     vec![],
                     vec![ExpressionBody::ProcedureCall(
-                        Box::new(ExpressionBody::Identifier("+".to_string()).into()),
+                        Box::new(ExpressionBody::Symbol("+".to_string()).into()),
                         vec![
-                            ExpressionBody::Identifier("x".to_string()).into(),
-                            ExpressionBody::Identifier("y".to_string()).into()
+                            ExpressionBody::Symbol("x".to_string()).into(),
+                            ExpressionBody::Symbol("y".to_string()).into()
                         ]
                     )
                     .into()]
@@ -1656,26 +1620,39 @@ fn literals() -> Result<()> {
             asts,
             vec![
                 Statement::Expression(
-                    ExpressionBody::Quote(Box::new(Primitive::Integer(1).into())).into()
-                ),
-                Statement::Expression(
                     ExpressionBody::Quote(Box::new(
-                        ExpressionBody::Identifier("a".to_string()).into(),
+                        DatumBody::Primitive(Primitive::Integer(1)).into()
                     ))
                     .into()
                 ),
                 Statement::Expression(
+                    ExpressionBody::Quote(Box::new(DatumBody::Symbol("a".to_string()).into(),))
+                        .into()
+                ),
+                Statement::Expression(
                     ExpressionBody::Quote(Box::new(
-                        ExpressionBody::List(vec![Primitive::Integer(1).into()]).into()
+                        DatumBody::List(list!(
+                            DatumBody::Primitive(Primitive::Integer(1)).no_locate()
+                        ))
+                        .into()
                     ))
                     .into()
                 ),
                 Statement::Expression(
-                    ExpressionBody::Vector(vec![Primitive::Integer(1).into()]).into()
+                    ExpressionBody::Datum(
+                        DatumBody::Vector(vec![
+                            DatumBody::Primitive(Primitive::Integer(1)).no_locate()
+                        ])
+                        .into()
+                    )
+                    .into()
                 ),
                 Statement::Expression(
                     ExpressionBody::Quote(Box::new(
-                        ExpressionBody::Vector(vec![Primitive::Integer(1).into()]).into()
+                        DatumBody::Vector(vec![
+                            DatumBody::Primitive(Primitive::Integer(1)).no_locate()
+                        ])
+                        .into()
                     ))
                     .into()
                 ),

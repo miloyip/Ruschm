@@ -1,4 +1,4 @@
-use super::{DefinitionBody, TokenData};
+use super::{Datum, DefinitionBody, TokenData};
 use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Clone)]
@@ -9,6 +9,8 @@ pub enum SyntaxError {
     UnexpectedCharacter(char),
     #[error("unexpected {0}")]
     UnexpectedToken(TokenData),
+    #[error("unexpected {0}")]
+    UnexpectedDatum(Datum),
     #[error("unexpect end of input")]
     UnexpectedEnd,
     #[error("unrecognized token")]
@@ -17,6 +19,8 @@ pub enum SyntaxError {
     UnknownEscape(char),
     #[error("unmactched parentheses!")]
     UnmatchedParentheses,
+    #[error("try to define non-symbol {0}")]
+    DefineNonSymbol(Datum),
     #[error("no expression found in function body")]
     LambdaBodyNoExpression,
     #[error("expect a {0}")]
